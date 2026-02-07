@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "747875914385",
+    "project_id": "brewlogapp",
+    "storage_bucket": "brewlogapp.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:747875914385:android:f4fc80650a53b15e522530",
+        "android_client_info": {
+          "package_name": "com.example.brew_log"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCd4646xT20Oa9IXIHzVYNx0pSNPVc6rP8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
