@@ -36,6 +36,7 @@ To install the app on a real iPhone, you must set up the following **Secrets** i
 | `P12_PASSWORD` | The password for your `.p12` file. |
 | `BUILD_PROVISION_PROFILE_BASE64` | Your Provisioning Profile (`.mobileprovision`) converted to Base64. |
 | `KEYCHAIN_PASSWORD` | A temporary password for the build keychain (can be any string). |
+| `TEAM_ID` | Your Apple Developer Team ID (found in Membership details). |
 
 **To generate Base64 strings:**
 ```bash

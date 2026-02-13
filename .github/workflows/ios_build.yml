@@ -61,14 +61,20 @@ jobs:
           cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
 
       # Build IPA
-      # If no secrets are provided, this will fail or we can build no-codesign (but that won't install on iPhone)
-      # For now, we attempt a build. If signing fails, the user needs to add secrets.
       - name: Build iOS IPA
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
           if [ -z "${{ secrets.P12_BASE64 }}" ]; then
             echo "::warning::No signing secrets found. Building unsigned .app for simulator or debugging."
             flutter build ios --release --no-codesign
           else
+            # Inject Team ID into ExportOptions.plist
+            if [ -n "$TEAM_ID" ]; then
+              sed -i '' "s/TEAM_ID_PLACEHOLDER/$TEAM_ID/g" ios/Runner/ExportOptions.plist
+            else
+               echo "::warning::TEAM_ID secret not found. Using placeholder in ExportOptions.plist which might fail."
+            fi
             flutter build ipa --release --export-options-plist=ios/Runner/ExportOptions.plist
           fi
 
