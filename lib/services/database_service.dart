@@ -1,9 +1,12 @@
 import 'package:firedart/firedart.dart';
 import '../models/brew_recipe.dart';
 
+import 'dart:async';
+
 class DatabaseService {
   final CollectionReference _recipesCollection = Firestore.instance.collection('recipes');
   List<BrewRecipe>? _cachedRecipes;
+  List<BrewRecipe>? get cachedRecipes => _cachedRecipes;
 
   // Add a new recipe
   // Add a new recipe
@@ -14,12 +17,30 @@ class DatabaseService {
 
   // Get a stream of recipes (for real-time updates)
   // Get a stream of recipes (for real-time updates)
-  Stream<List<BrewRecipe>> getRecipesStream() {
-    return _recipesCollection.stream.map((list) {
+  // Use a broadcast controller to allow multiple listeners
+  final _recipesController = StreamController<List<BrewRecipe>>.broadcast();
+
+  // Initialize listening to Firestore when service is created (or on first use)
+  DatabaseService() {
+    _startListening();
+  }
+
+  void _startListening() {
+    _recipesCollection.stream.listen((list) {
       final recipes = list.map((doc) => BrewRecipe.fromMap(doc.id, doc.map)).toList();
       recipes.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-      return recipes;
-    }).asBroadcastStream();
+      _cachedRecipes = recipes;
+      _recipesController.add(recipes);
+    });
+  }
+
+  Stream<List<BrewRecipe>> getRecipesStream() {
+    // If we have cached data, emit it immediately for the new listener
+    if (_cachedRecipes != null) {
+      // Use microtask to ensure listener is ready
+      Future.microtask(() => _recipesController.add(_cachedRecipes!));
+    }
+    return _recipesController.stream;
   }
 
   // Get a stream of a SINGLE recipe

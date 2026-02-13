@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import '../models/brew_recipe.dart';
 
 class LiveBrewScreen extends StatefulWidget {
@@ -11,20 +12,37 @@ class LiveBrewScreen extends StatefulWidget {
   State<LiveBrewScreen> createState() => _LiveBrewScreenState();
 }
 
-class _LiveBrewScreenState extends State<LiveBrewScreen> {
-  late Timer _timer;
-  int _elapsedMilliseconds = 0; // Changed to ms for smoothness
-  int _totalElapsedMilliseconds = 0; // Continues even after finish
+class _LiveBrewScreenState extends State<LiveBrewScreen> with SingleTickerProviderStateMixin {
+  late Ticker _ticker;
+  Duration _elapsed = Duration.zero;
   bool _isRunning = false;
   bool _isRecipeFinished = false;
   List<_ParsedStep> _parsedSteps = [];
 
+  // For total elapsed time (running brew duration)
+  Duration _totalElapsed = Duration.zero; // This tracks actual time user spent brewing
+  
   @override
   void initState() {
     super.initState();
     _parseSteps();
+    _ticker = createTicker(_onTick);
   }
 
+  void _onTick(Duration elapsed) {
+    // Ticker callback runs every frame. We need to trigger a rebuild.
+    setState(() {});
+  }
+  
+  // Re-thinking: Use Stopwatch for accuracy + Ticker for UI updates.
+  final Stopwatch _stopwatch = Stopwatch();
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+  
   void _parseSteps() {
     _parsedSteps = widget.recipe.steps.map((step) {
       return _ParsedStep(
@@ -32,65 +50,44 @@ class _LiveBrewScreenState extends State<LiveBrewScreen> {
         startTimeSeconds: _parseTime(step.time),
       );
     }).toList();
-    
-    // Sort by time just in case
     _parsedSteps.sort((a, b) => a.startTimeSeconds.compareTo(b.startTimeSeconds));
   }
 
   int _parseTime(String timeStr) {
     String cleanTime = timeStr.trim();
     if (cleanTime.isEmpty) return 0;
-
-    // Handle ranges like "0:00 - 0:05" by taking the start time
-    if (cleanTime.contains('-')) {
-      cleanTime = cleanTime.split('-')[0].trim();
-    }
-
+    if (cleanTime.contains('-')) cleanTime = cleanTime.split('-')[0].trim();
     try {
       final parts = cleanTime.split(':');
-      if (parts.length == 2) {
-        return int.parse(parts[0]) * 60 + int.parse(parts[1]);
-      }
-      return int.parse(cleanTime); // Assume seconds if no colon
+      if (parts.length == 2) return int.parse(parts[0]) * 60 + int.parse(parts[1]);
+      return int.parse(cleanTime);
     } catch (e) {
-      print('Error parsing time: $timeStr');
-      return 0; // Default to 0 on error
+      return 0;
     }
   }
 
   void _toggleTimer() {
     setState(() {
       _isRunning = !_isRunning;
+      if (_isRunning) {
+        _stopwatch.start();
+        _ticker.start();
+      } else {
+        _stopwatch.stop();
+        _ticker.stop();
+      }
     });
-
-    if (_isRunning) {
-      _timer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
-        setState(() {
-          _totalElapsedMilliseconds += 100;
-          if (!_isRecipeFinished) {
-             _elapsedMilliseconds += 100;
-          }
-        });
-      });
-    } else {
-      _timer.cancel();
-    }
   }
 
   void _stopTimer() {
-    _timer.cancel();
+    _stopwatch.stop();
+    _stopwatch.reset();
+    _ticker.stop();
     setState(() {
       _isRunning = false;
-      _elapsedMilliseconds = 0;
-      _totalElapsedMilliseconds = 0;
       _isRecipeFinished = false;
+      _elapsed = Duration.zero;
     });
-  }
-
-  @override
-  void dispose() {
-    if (_isRunning) _timer.cancel();
-    super.dispose();
   }
 
   String _formatTime(int totalSeconds) {
@@ -99,179 +96,161 @@ class _LiveBrewScreenState extends State<LiveBrewScreen> {
     return '$m:$s';
   }
 
-  String _getWaterTargetDisplay(_ParsedStep? current) {
-    if (current == null) return '';
-    String currentAmount = current.step.waterAmount; // e.g. "150ml"
-    
-    // Attempt to find total water from last step
-    String totalAmount = '';
-    if (_parsedSteps.isNotEmpty) {
-      totalAmount = _parsedSteps.last.step.waterAmount;
-    }
-    
-    if (totalAmount.isNotEmpty && currentAmount != totalAmount) {
-      return '$currentAmount / $totalAmount';
-    }
-    return currentAmount;
-  }
-
   _ParsedStep? _getCurrentStep() {
-    // Find the latest step that has started
+    int elapsedSeconds = _stopwatch.elapsed.inSeconds;
     _ParsedStep? current;
-    int elapsedSeconds = _elapsedMilliseconds ~/ 1000;
     for (var step in _parsedSteps) {
-      if (elapsedSeconds >= step.startTimeSeconds) {
-        current = step;
-      } else {
-        break; // Future step
-      }
+      if (elapsedSeconds >= step.startTimeSeconds) current = step;
+      else break;
     }
     return current;
   }
 
-  _ParsedStep? _getNextStep() {
-    int elapsedSeconds = _elapsedMilliseconds ~/ 1000;
-    for (var step in _parsedSteps) {
-      if (elapsedSeconds < step.startTimeSeconds) {
-        return step;
-      }
-    }
-    return null;
-  }
-
   // Helper to determine if we are in a "Wait" phase of the current step
-  bool _isWaitingPhase(_ParsedStep? current, _ParsedStep? next) {
+  bool _isWaitingPhase(_ParsedStep? current, _ParsedStep? next, int totalBrewTime) {
     if (current == null) return false;
     
-    // Calculate duration of current step
     final start = current.startTimeSeconds;
-    final end = next?.startTimeSeconds ?? (_parsedSteps.last.startTimeSeconds + 45); // fallback end
+    final end = next?.startTimeSeconds ?? totalBrewTime;
     final duration = end - start;
     
-    // If step is long (> 20s), assume first 15s is Action, rest is Wait
-    if (duration > 20) {
-      final elapsedInStep = (_elapsedMilliseconds ~/ 1000) - start;
-      return elapsedInStep >= 15;
+    // Dynamic Action Duration:
+    // Default 12s for long steps (enough for pouring)
+    // For shorter steps, use half the duration
+    int actionDuration = 12;
+    if (duration < 24) {
+      actionDuration = duration ~/ 2;
     }
-    return false;
-  }
+    
+    // If step is really short (< 6s), don't show wait at all
+    if (duration < 6) return false;
 
-  String _getCurrentActionTitle(_ParsedStep? current, bool isWaiting) {
-    if (current == null) return 'Get Ready...';
-    if (isWaiting) return 'WAIT';
-    return current.step.title;
+    final elapsedInStep = _stopwatch.elapsed.inSeconds - start;
+    return elapsedInStep >= actionDuration;
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    // Determine active step index directly
-    int activeIndex = -1;
-    int elapsedSeconds = _elapsedMilliseconds ~/ 1000;
     
+    // Calculate progress
+    final totalBrewTimeSeconds = widget.recipe.brewTimeSeconds > 0 
+        ? widget.recipe.brewTimeSeconds 
+        : (_parsedSteps.isNotEmpty ? _parsedSteps.last.startTimeSeconds + 30 : 300);
+        
+    final currentElapsed = _stopwatch.elapsed;
+    
+    if (currentElapsed.inSeconds >= totalBrewTimeSeconds && !_isRecipeFinished) {
+       // Finish!
+       // We should stop the timer here automatically
+       // But we can't call setState directly during build if we triggered it here.
+       // Schedule a microtask to stop.
+       Future.microtask(() {
+         if (mounted && _isRunning) {
+            _stopwatch.stop();
+            _ticker.stop();
+            setState(() {
+              _isRunning = false;
+              _isRecipeFinished = true;
+            });
+         }
+       });
+    }
+
+    final elapsedSeconds = currentElapsed.inSeconds;
+    
+    // Find active step index
+    int activeIndex = -1;
     for (int i = 0; i < _parsedSteps.length; i++) {
-      if (elapsedSeconds >= _parsedSteps[i].startTimeSeconds) {
-        activeIndex = i;
-      } else {
-        break; 
-      }
+      if (elapsedSeconds >= _parsedSteps[i].startTimeSeconds) activeIndex = i;
+      else break;
     }
 
     final currentStep = activeIndex != -1 ? _parsedSteps[activeIndex] : null;
     final nextStep = (activeIndex + 1 < _parsedSteps.length) ? _parsedSteps[activeIndex + 1] : null;
 
-    // Per-step progress
-    double progress = 0.0;
+    // Smooth Progress Bar
+    // Calculate progress based on current step duration
+    double stepProgress = 0.0;
     if (currentStep != null) {
       final start = currentStep.startTimeSeconds;
-      final end = nextStep?.startTimeSeconds ?? (start + 30); 
+      final end = nextStep?.startTimeSeconds ?? totalBrewTimeSeconds;
       final duration = end - start;
       if (duration > 0) {
-        progress = ((_elapsedMilliseconds - (start * 1000)) / (duration * 1000)).clamp(0.0, 1.0);
+        final elapsedInStep = _stopwatch.elapsedMilliseconds - (start * 1000);
+        stepProgress = (elapsedInStep / (duration * 1000)).clamp(0.0, 1.0);
       } else {
-        progress = 1.0;
+        stepProgress = 1.0;
       }
     } else if (_parsedSteps.isNotEmpty && elapsedSeconds < _parsedSteps.first.startTimeSeconds) {
+      // Pre-brew waiting
        final end = _parsedSteps.first.startTimeSeconds;
-       if (end > 0) progress = (_elapsedMilliseconds / (end * 1000)).clamp(0.0, 1.0);
+       if (end > 0) {
+         stepProgress = (currentElapsed.inMilliseconds / (end * 1000)).clamp(0.0, 1.0);
+       }
     }
-
-    // Check if finished
-    final recipeTotalTime = widget.recipe.brewTimeSeconds > 0 ? widget.recipe.brewTimeSeconds : 0;
-    final lastStepEnd = _parsedSteps.isNotEmpty ? _parsedSteps.last.startTimeSeconds + 45 : 300;
-    final totalBrewTime = recipeTotalTime > 0 ? recipeTotalTime : lastStepEnd;
     
-    // Auto-stop logic
-    if (elapsedSeconds >= totalBrewTime && !_isRecipeFinished) {
-       _isRecipeFinished = true;
-       progress = 1.0;
-       // We stop incrementing _elapsedMilliseconds in the periodic callback checks
-    } else if (_isRecipeFinished) {
-        progress = 1.0;
-    }
+    if (_isRecipeFinished) stepProgress = 1.0;
 
-    // Determine UI State
-    final isWaiting = _isWaitingPhase(currentStep, nextStep);
-    final actionTitle = _getCurrentActionTitle(currentStep, isWaiting);
-    
-    // Calculate remaining wait time if in wait phase
+    // WAIT Logic
+    bool isWaiting = false;
     String? waitTimeLeft;
-    if (isWaiting && currentStep != null) {
-      final end = nextStep?.startTimeSeconds ?? totalBrewTime;
-      final remaining = end - elapsedSeconds;
-      if (remaining > 0) waitTimeLeft = '${remaining}s';
+    if (currentStep != null && !_isRecipeFinished) {
+      isWaiting = _isWaitingPhase(currentStep, nextStep, totalBrewTimeSeconds);
+      if (isWaiting) {
+        final start = currentStep.startTimeSeconds;
+        final end = nextStep?.startTimeSeconds ?? totalBrewTimeSeconds;
+        final remaining = end - elapsedSeconds;
+        if (remaining > 0) waitTimeLeft = '${remaining}s';
+      }
     }
 
+    // UI structure similar to before but utilizing _stopwatch data
     return Scaffold(
       backgroundColor: theme.colorScheme.primary,
       appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Colors.white),
           onPressed: () => Navigator.pop(context),
         ),
         title: const Text('Live Brew', style: TextStyle(color: Colors.white)),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
         centerTitle: true,
         actions: [
           TextButton(
-            onPressed: () {
-               _stopTimer();
-               Navigator.pop(context);
-            },
-            child: const Text('Exit', style: TextStyle(color: Colors.white)),
+             onPressed: () { _stopTimer(); Navigator.pop(context); },
+             child: const Text('Exit', style: TextStyle(color: Colors.white))
           )
         ],
       ),
       body: Column(
         children: [
-          // Header Info
-          Text(
+           // Info Header
+           Text(
             '${widget.recipe.brewingMethod} • ${widget.recipe.ratio} • ${widget.recipe.coffeeName}',
             style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 14),
           ),
-          
           const SizedBox(height: 40),
-
-          // Big Timer Circle
+          
+          // Timer Circle
           Stack(
             alignment: Alignment.center,
             children: [
               SizedBox(
-                width: 280,
-                height: 280,
+                width: 280, height: 280,
                 child: CircularProgressIndicator(
-                  value: progress,
+                  value: stepProgress,
                   strokeWidth: 12,
                   backgroundColor: Colors.white.withOpacity(0.2), 
-                  valueColor: const AlwaysStoppedAnimation<Color>(Colors.orange), 
+                  valueColor: const AlwaysStoppedAnimation<Color>(Colors.orange),
                 ),
               ),
               Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                    Text(
-                    _formatTime(_elapsedMilliseconds ~/ 1000),
+                    _formatTime(elapsedSeconds),
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 64,
@@ -279,30 +258,30 @@ class _LiveBrewScreenState extends State<LiveBrewScreen> {
                       fontFeatures: [FontFeature.tabularFigures()],
                     ),
                   ),
-                  if (currentStep != null)
+                  if (currentStep != null && !_isRecipeFinished)
                      Padding(
                        padding: const EdgeInsets.only(top: 8.0),
                        child: Text(
-                         _getWaterTargetDisplay(currentStep),
+                         currentStep.step.waterAmount, // Simplification: just show target
                          style: const TextStyle(color: Color(0xFF64B5F6), fontSize: 16, fontWeight: FontWeight.w500),
                        ),
                      ),
-                  // Secondary Continuous Timer
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8.0),
-                    child: Text(
-                      'Total: ${_formatTime(_totalElapsedMilliseconds ~/ 1000)}',
-                      style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 14),
-                    ),
-                  ),
+                  if (_isRecipeFinished)
+                     const Padding(
+                       padding: EdgeInsets.only(top: 8.0),
+                       child: Text(
+                         'DONE',
+                         style: TextStyle(color: Colors.greenAccent, fontSize: 20, fontWeight: FontWeight.bold),
+                       ),
+                     ),
                 ],
               ),
             ],
           ),
-
+          
           const SizedBox(height: 50),
-
-          // Current Instruction Card
+          
+          // Bottom Card
           Expanded(
             child: Container(
               width: double.infinity,
@@ -313,100 +292,77 @@ class _LiveBrewScreenState extends State<LiveBrewScreen> {
               ),
               child: Column(
                 children: [
-                  // Active Step
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(24),
-                      boxShadow: [
-                        BoxShadow(
-                            color: Colors.black.withOpacity(0.05),
-                            blurRadius: 10,
-                            offset: const Offset(0, 4)),
-                      ],
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          currentStep != null ? 'Current Action' : 'Get Ready',
-                          style: TextStyle(color: Colors.grey[600], fontSize: 14, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 8),
-                          if (_isRecipeFinished)
-                             Text('Enjoy your brew!', style: TextStyle(color: theme.colorScheme.primary, fontSize: 24, fontWeight: FontWeight.bold))
-                          else
-                             Column(
-                               crossAxisAlignment: CrossAxisAlignment.start,
-                               children: [
-                                 Text(
-                                   actionTitle,
-                                   style: TextStyle(
-                                     color: isWaiting ? Colors.orange : theme.colorScheme.primary, 
-                                     fontSize: isWaiting ? 48 : 24, 
-                                     fontWeight: FontWeight.bold
-                                   ),
-                                 ),
-                                 if (waitTimeLeft != null)
-                                    Text(
-                                      '$waitTimeLeft left',
-                                      style: TextStyle(color: Colors.grey[600], fontSize: 18),
-                                    ),
-                               ],
+                   // Active Step Card
+                   Container(
+                     width: double.infinity,
+                     padding: const EdgeInsets.all(20),
+                     decoration: BoxDecoration(
+                       color: Colors.white,
+                       borderRadius: BorderRadius.circular(24),
+                       boxShadow: [
+                         BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 4)),
+                       ],
+                     ),
+                     child: _isRecipeFinished 
+                       ? Column(
+                           children: [
+                             Icon(Icons.check_circle, color: theme.colorScheme.primary, size: 48),
+                             const SizedBox(height: 8),
+                             Text('Enjoy your coffee!', style: TextStyle(color: theme.colorScheme.primary, fontSize: 24, fontWeight: FontWeight.bold)),
+                           ],
+                         )
+                       : Column(
+                           crossAxisAlignment: CrossAxisAlignment.start,
+                           children: [
+                             Text(currentStep != null ? 'Current Action' : 'Get Ready', style: TextStyle(color: Colors.grey[600], fontSize: 14, fontWeight: FontWeight.bold)),
+                             const SizedBox(height: 8),
+                             Text(
+                               isWaiting ? 'WAIT' : (currentStep?.step.title ?? 'Prepare'),
+                               style: TextStyle(
+                                 color: isWaiting ? Colors.orange : theme.colorScheme.primary,
+                                 fontSize: isWaiting ? 48 : 24,
+                                 fontWeight: FontWeight.bold
+                               ),
                              ),
-                        if (!_isRecipeFinished && !isWaiting && currentStep != null && currentStep.step.waterAmount.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 8.0),
-                            child: Text(
-                              'Target: ${currentStep.step.waterAmount}',
-                              style: const TextStyle(color: Colors.black87, fontSize: 16),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                  
-                  const SizedBox(height: 20),
-
-                  // Next Step Preview
-                  if (nextStep != null)
-                    Row(
-                      children: [
-                        const Text('Next: ', style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
-                        Text('${nextStep.step.title} at ${_formatTime(nextStep.startTimeSeconds)}', style: const TextStyle(fontWeight: FontWeight.w500)),
-                      ],
-                    ),
-
-                  const Spacer(),
-
-                  // Controls
-                  Row(
-                    children: [
-                      Expanded(
-                        child: SizedBox(
-                          height: 56,
-                          child: ElevatedButton(
-                            onPressed: _isRunning ? () {
-                               _toggleTimer();
-                            } : _toggleTimer,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: _isRunning ? Colors.white : theme.colorScheme.primary,
-                              foregroundColor: _isRunning ? theme.colorScheme.primary : Colors.white,
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                              elevation: 0,
-                              side: _isRunning ? BorderSide(color: theme.colorScheme.primary) : null,
-                            ),
-                            child: Text(
-                              _isRunning ? 'Pause' : 'Start',
-                              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ),
+                             if (waitTimeLeft != null)
+                               Text('$waitTimeLeft left', style: TextStyle(color: Colors.grey[600], fontSize: 18)),
+                           ],
+                         ),
+                   ),
+                   
+                   const SizedBox(height: 20),
+                   
+                   // Next Step
+                   if (nextStep != null && !_isRecipeFinished)
+                      Row(
+                        children: [
+                          const Text('Next: ', style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+                          Text('${nextStep.step.title} at ${_formatTime(nextStep.startTimeSeconds)}', style: const TextStyle(fontWeight: FontWeight.w500)),
+                        ],
                       ),
-                    ],
-                  ),
+                      
+                   const Spacer(),
+                   
+                   // Button
+                   SizedBox(
+                     width: double.infinity,
+                     height: 56,
+                     child: ElevatedButton(
+                       onPressed: _isRecipeFinished 
+                         ? () => Navigator.pop(context)
+                         : (_isRunning ? _toggleTimer : _toggleTimer),
+                       style: ElevatedButton.styleFrom(
+                         backgroundColor: _isRecipeFinished ? theme.colorScheme.primary : (_isRunning ? Colors.white : theme.colorScheme.primary),
+                         foregroundColor: _isRecipeFinished ? Colors.white : (_isRunning ? theme.colorScheme.primary : Colors.white),
+                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                         side: _isRunning && !_isRecipeFinished ? BorderSide(color: theme.colorScheme.primary) : null,
+                       ),
+                       child: Text(
+                         _isRecipeFinished ? 'Finish' : (_isRunning ? 'Pause' : 'Start'),
+                         style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                       ),
+                     ),
+                   )
                 ],
               ),
             ),
@@ -420,6 +376,5 @@ class _LiveBrewScreenState extends State<LiveBrewScreen> {
 class _ParsedStep {
   final BrewStep step;
   final int startTimeSeconds;
-
   _ParsedStep({required this.step, required this.startTimeSeconds});
 }

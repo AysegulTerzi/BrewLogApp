@@ -233,6 +233,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   child: StreamBuilder<List<BrewRecipe>>(
                     stream: databaseService.getRecipesStream(),
+                    initialData: databaseService.cachedRecipes, // Use cached data immediately
                     builder: (context, snapshot) {
                       if (snapshot.connectionState == ConnectionState.waiting) {
                         return const Center(child: CircularProgressIndicator());
